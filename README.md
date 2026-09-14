@@ -6,7 +6,7 @@
 
 **A live production, dispatch, and manpower dashboard — built to replace manual, error-prone Excel reporting with one real-time source of truth.**
 
-[![Live Demo](https://img.shields.io/badge/demo-live-brightgreen)](https://salasar-techno-engg.vercel.app/)
+[![Live Demo](https://img.shields.io/badge/demo-live-brightgreen)](https://salasar-dashboard.vercel.app/)
 ![MERN](https://img.shields.io/badge/stack-MERN-6e56cf)
 ![React](https://img.shields.io/badge/frontend-React%20%2B%20Vite-61dafb)
 ![Node](https://img.shields.io/badge/backend-Node%20%2B%20Express-339933)

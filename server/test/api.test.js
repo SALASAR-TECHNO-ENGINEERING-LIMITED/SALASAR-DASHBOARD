@@ -2,6 +2,8 @@ import './helpers/env.js';
 import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import jwt from 'jsonwebtoken';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { app } from '../src/app.js';
 import { env, isAllowedLogin, roleFor } from '../src/config/env.js';
 import { parseDateRange } from '../src/controllers/dashboard.controller.js';
@@ -44,6 +46,36 @@ describe('configuration', () => {
   test('the role comes from ADMIN_EMAILS, case-insensitively', () => {
     assert.equal(roleFor('ADMIN@salasartechno.com'), 'admin');
     assert.equal(roleFor('someone@salasartechno.com'), 'manager');
+  });
+
+  // config/env.js is evaluated once per process, so the Render case runs in a child process
+  // (cwd = test/, where there is no .env for dotenv to fill gaps from).
+  test('on Render, an unset or localhost OAuth redirect URI is derived from RENDER_EXTERNAL_URL', () => {
+    const { status, stdout, stderr } = spawnSync(process.execPath, ['--input-type=module', '-e', `
+      const { env } = await import(${JSON.stringify(pathToFileURL(fileURLToPath(new URL('../src/config/env.js', import.meta.url))).href)});
+      console.log(JSON.stringify([env.googleLoginRedirectUri, env.googleDriveRedirectUri, env.gmailSendRedirectUri]));
+    `], {
+      cwd: fileURLToPath(new URL('.', import.meta.url)),
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        RENDER: 'true',
+        RENDER_EXTERNAL_URL: 'https://api.example.onrender.com/',
+        GOOGLE_LOGIN_REDIRECT_URI: 'http://localhost:5001/api/auth/google/callback',
+        GOOGLE_DRIVE_REDIRECT_URI: 'https://custom.example.com/api/auth/google/connect-drive/callback',
+        GMAIL_SEND_REDIRECT_URI: '',
+      },
+    });
+    assert.equal(status, 0, stderr);
+    assert.deepEqual(JSON.parse(stdout.trim().split('\n').pop()), [
+      'https://api.example.onrender.com/api/auth/google/callback',
+      'https://custom.example.com/api/auth/google/connect-drive/callback', // explicit, left alone
+      'https://api.example.onrender.com/api/auth/google/connect-gmail/callback',
+    ]);
+  });
+
+  test('off Render the redirect URIs keep their configured / localhost values', () => {
+    assert.equal(env.googleLoginRedirectUri, 'http://localhost:5001/api/auth/google/callback');
   });
 });
 

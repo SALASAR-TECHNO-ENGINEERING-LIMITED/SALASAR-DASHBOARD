@@ -29,6 +29,25 @@ function secret(name) {
   return value;
 }
 
+// The OAuth redirect URIs default to localhost for development. The Sep 2026 move to
+// salasar-dashboard.onrender.com shipped with a server/.env copied into Render, localhost URIs
+// and all: the server started, CORS passed, and every sign-in sent Google's reply to
+// localhost:5001 on the user's own machine. On Render the server knows its public URL, so a
+// URI there that is unset or still points at localhost is always a mistake — derive it
+// instead, and say so in the log. (Google still has to list the result as an authorised
+// redirect URI on the OAuth client.)
+const renderUrl = (process.env.RENDER_EXTERNAL_URL || '').replace(/\/+$/, '');
+function redirectUri(name, path) {
+  const configured = process.env[name];
+  const pointsAtLocalhost = /^https?:\/\/(localhost|127\.0\.0\.1)(:|\/|$)/i.test(configured || '');
+  if (renderUrl && (!configured || pointsAtLocalhost)) {
+    const derived = `${renderUrl}${path}`;
+    console.warn(`[env] ${name} is ${configured ? `"${configured}"` : 'unset'} on Render — using ${derived}`);
+    return derived;
+  }
+  return required(name, `http://localhost:5001${path}`);
+}
+
 export const env = {
   nodeEnv: process.env.NODE_ENV || 'development',
   port: Number(process.env.PORT || 5001),
@@ -37,9 +56,9 @@ export const env = {
 
   googleClientId: required('GOOGLE_CLIENT_ID'),
   googleClientSecret: required('GOOGLE_CLIENT_SECRET'),
-  googleLoginRedirectUri: required('GOOGLE_LOGIN_REDIRECT_URI', 'http://localhost:5001/api/auth/google/callback'),
-  googleDriveRedirectUri: required('GOOGLE_DRIVE_REDIRECT_URI', 'http://localhost:5001/api/auth/google/connect-drive/callback'),
-  gmailSendRedirectUri: required('GMAIL_SEND_REDIRECT_URI', 'http://localhost:5001/api/auth/google/connect-gmail/callback'),
+  googleLoginRedirectUri: redirectUri('GOOGLE_LOGIN_REDIRECT_URI', '/api/auth/google/callback'),
+  googleDriveRedirectUri: redirectUri('GOOGLE_DRIVE_REDIRECT_URI', '/api/auth/google/connect-drive/callback'),
+  gmailSendRedirectUri: redirectUri('GMAIL_SEND_REDIRECT_URI', '/api/auth/google/connect-gmail/callback'),
 
   jwtSecret: secret('JWT_SECRET'),
   jwtExpiresIn: process.env.JWT_EXPIRES_IN || '12h',
