@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { useSearchParams } from 'react-router-dom';
 import { EmailComposer } from '../components/email/EmailComposer';
+import { ImageReportBuilder } from '../components/email/ImageReportBuilder';
 import { fetchGmailSendStatus, API_BASE } from '../lib/api';
 import {
   ZETWERK_SUBJECT,
@@ -52,7 +53,13 @@ const GMAIL_CONNECT_MESSAGES = {
   missing_code: { text: 'Gmail connection was cancelled.', good: false },
 };
 
+const MODES = {
+  emailReports: 'Email reports',
+  createImageReports: 'Create Image Reports',
+};
+
 export function Email() {
+  const [mode, setMode] = useState('emailReports');
   const [activeTab, setActiveTab] = useState('zetwerk');
   const report = REPORTS[activeTab];
   const [params] = useSearchParams();
@@ -65,11 +72,38 @@ export function Email() {
   });
 
   return (
-    <div className="mx-auto max-w-3xl px-4 py-6 sm:px-6">
-      <h1 className="mb-4 text-xl font-semibold" style={{ color: 'var(--text-primary)' }}>
-        Email
-      </h1>
+    <div className={`mx-auto px-4 py-6 sm:px-6 ${mode === 'createImageReports' ? 'max-w-5xl' : 'max-w-3xl'}`}>
+      <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+        <h1 className="text-xl font-semibold" style={{ color: 'var(--text-primary)' }}>
+          Email
+        </h1>
+        <div className="flex gap-1 rounded-xl border p-1" style={{ background: 'var(--surface-1)' }} role="tablist" aria-label="Email tools">
+          {Object.entries(MODES).map(([key, label]) => (
+            <button
+              key={key}
+              type="button"
+              role="tab"
+              aria-selected={mode === key}
+              onClick={() => setMode(key)}
+              className={`rounded-lg px-4 py-1.5 text-sm font-medium transition-colors ${FOCUS_RING}`}
+              style={{
+                background: mode === key ? 'var(--series-1)' : 'transparent',
+                color: mode === key ? '#ffffff' : 'var(--text-secondary)',
+              }}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+      </div>
 
+      {/* Kept mounted while hidden, so switching to the email view and back does not throw away
+          the screenshots already pasted. */}
+      <div hidden={mode !== 'createImageReports'}>
+        <ImageReportBuilder active={mode === 'createImageReports'} />
+      </div>
+
+      <div hidden={mode !== 'emailReports'}>
       {connectMessage && (
         <div
           className="mb-4 rounded-lg border px-4 py-3 text-sm"
@@ -119,6 +153,7 @@ export function Email() {
         defaultCc={report.cc}
         bodyHtml={report.body}
       />
+      </div>
     </div>
   );
 }
