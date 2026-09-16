@@ -1,4 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
+import { AnimatePresence, motion } from 'framer-motion';
 import { format } from 'date-fns';
 
 // Stitches pasted screenshots (manpower grid, progress blocks, dispatch summary, …) into one
@@ -64,6 +66,51 @@ async function loadImage(file) {
   return { url, img, width: img.naturalWidth, height: img.naturalHeight };
 }
 
+const TOAST_MS = 3500;
+
+// Rendered into <body>: the builder sits inside a container the Email page hides when the other
+// view is open, and a fixed-position child of a hidden element is never shown. The live region
+// itself is always present, so screen readers announce each toast as it appears.
+function Toast({ toast, onClose }) {
+  return createPortal(
+    <div role="status" aria-live="polite" className="pointer-events-none fixed inset-x-0 bottom-6 z-50 flex justify-center px-4">
+      <AnimatePresence>
+        {toast && (
+          <motion.div
+            key={toast.id}
+            initial={{ opacity: 0, y: 16, scale: 0.97 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            exit={{ opacity: 0, y: 16, scale: 0.97 }}
+            transition={{ duration: 0.18 }}
+            className="pointer-events-auto flex w-full max-w-sm items-start gap-3 rounded-xl border px-4 py-3 shadow-lg"
+            style={{ background: 'var(--surface-1)', borderColor: toast.good ? 'var(--status-good)' : 'var(--status-critical)' }}
+          >
+            <span
+              aria-hidden="true"
+              className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full text-xs font-bold text-white"
+              style={{ background: toast.good ? 'var(--status-good)' : 'var(--status-critical)' }}
+            >
+              {toast.good ? '✓' : '!'}
+            </span>
+            <div className="min-w-0 flex-1">
+              <div className="text-sm font-medium" style={{ color: 'var(--text-primary)' }}>
+                {toast.title}
+              </div>
+              <div className="mt-0.5 text-xs" style={{ color: 'var(--text-muted)' }}>
+                {toast.detail}
+              </div>
+            </div>
+            <button type="button" onClick={onClose} aria-label="Dismiss" className={`shrink-0 rounded-sm text-xs leading-none ${FOCUS_RING}`} style={{ color: 'var(--text-muted)' }}>
+              ✕
+            </button>
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </div>,
+    document.body,
+  );
+}
+
 let nextSeq = 0;
 
 export function ImageReportBuilder({ active }) {
@@ -74,6 +121,7 @@ export function ImageReportBuilder({ active }) {
   const [composing, setComposing] = useState(false);
   const [notice, setNotice] = useState(null); // { text, good }
   const [dropActive, setDropActive] = useState(false);
+  const [toast, setToast] = useState(null); // { id, good, title, detail }
   const fileInputRef = useRef(null);
   const dragIndexRef = useRef(null);
   // Images decode asynchronously; a quick second paste could otherwise land above the first.
@@ -165,6 +213,13 @@ export function ImageReportBuilder({ active }) {
 
   useEffect(() => () => output && URL.revokeObjectURL(output.url), [output]);
 
+  // Keyed on the toast's id, so copying again while one is showing restarts its timer.
+  useEffect(() => {
+    if (!toast) return undefined;
+    const timer = setTimeout(() => setToast(null), TOAST_MS);
+    return () => clearTimeout(timer);
+  }, [toast]);
+
   function move(from, to) {
     setItems((list) => {
       if (to < 0 || to >= list.length || from === to) return list;
@@ -225,9 +280,19 @@ export function ImageReportBuilder({ active }) {
     try {
       // No await before this call: Safari only allows clipboard writes inside the click itself.
       await navigator.clipboard.write([new ClipboardItem({ 'image/png': output.blob })]);
-      setNotice({ text: 'Image copied — paste it with Ctrl+V into an email, WhatsApp, Excel, …', good: true });
+      setToast({
+        id: Date.now(),
+        good: true,
+        title: 'Image copied to clipboard',
+        detail: `${output.width} × ${output.height} px — paste it with Ctrl+V into an email, WhatsApp, Excel, …`,
+      });
     } catch {
-      setNotice({ text: 'This browser would not copy the image. Use Download, or right-click the preview → Copy image.', good: false });
+      setToast({
+        id: Date.now(),
+        good: false,
+        title: 'Could not copy the image',
+        detail: 'Use Download PNG, or right-click the preview → Copy image.',
+      });
     }
   }
 
@@ -249,6 +314,7 @@ export function ImageReportBuilder({ active }) {
 
   return (
     <div className="space-y-4">
+      <Toast toast={toast} onClose={() => setToast(null)} />
       <div
         onDragOver={handleDragOver}
         onDragLeave={(e) => !e.currentTarget.contains(e.relatedTarget) && setDropActive(false)}
