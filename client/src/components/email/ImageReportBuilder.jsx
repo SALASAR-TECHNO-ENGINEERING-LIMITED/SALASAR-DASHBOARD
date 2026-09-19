@@ -96,6 +96,59 @@ function layoutReport(sizes, { gap, margin, mode }) {
   return { width, height, boxes, rows: rows.length, scale };
 }
 
+// Free mode: the boxes are whatever the user dragged them to. The sheet is still trimmed to the
+// content — its width is the wider of the chosen sheet width and the furthest edge, its height
+// always the lowest edge plus the margin — so an arrangement never exports with a band of empty
+// white below it.
+function freeLayout(items, boxes, { margin, sheetWidth }) {
+  const placed = items.map((item) => boxes[item.id]);
+  if (placed.some((box) => !box)) return null; // a newly pasted image has not been placed yet
+  const width = Math.max(sheetWidth, ...placed.map((b) => b.x + b.w + margin));
+  const height = Math.max(...placed.map((b) => b.y + b.h)) + margin;
+  const scale = Math.min(1, MAX_SIDE / width, MAX_SIDE / height, Math.sqrt(MAX_AREA / (width * height)));
+  return { width, height, boxes: placed, rows: null, scale };
+}
+
+// Edges an item snaps to while being dragged: the sheet's margins and sides, and every edge and
+// centre line of the other items. Without this, lining two screenshots up by eye is a pixel-
+// hunting exercise and the result never looks deliberate.
+function snapValue(value, guides, tolerance) {
+  let best = value;
+  let bestGap = tolerance;
+  guides.forEach((guide) => {
+    const gap = Math.abs(guide - value);
+    if (gap < bestGap) {
+      bestGap = gap;
+      best = guide;
+    }
+  });
+  return best;
+}
+
+function snapBox(box, others, { margin, sheetWidth, tolerance }) {
+  const xGuides = [margin, sheetWidth - margin, 0, sheetWidth];
+  const yGuides = [margin, 0];
+  others.forEach((o) => {
+    xGuides.push(o.x, o.x + o.w, o.x + o.w / 2);
+    yGuides.push(o.y, o.y + o.h, o.y + o.h / 2);
+  });
+  // Try the leading edge, then the trailing one, so an item can line up by either side.
+  const left = snapValue(box.x, xGuides, tolerance);
+  const right = snapValue(box.x + box.w, xGuides, tolerance) - box.w;
+  const centreX = snapValue(box.x + box.w / 2, xGuides, tolerance) - box.w / 2;
+  const top = snapValue(box.y, yGuides, tolerance);
+  const bottom = snapValue(box.y + box.h, yGuides, tolerance) - box.h;
+  const pick = (candidates, fallback) => {
+    const hit = candidates.find((c) => c !== fallback);
+    return hit === undefined ? fallback : hit;
+  };
+  return {
+    ...box,
+    x: pick([left, right, centreX], box.x),
+    y: pick([top, bottom], box.y),
+  };
+}
+
 function drawReport(items, layout) {
   const { boxes, scale } = layout;
   const canvas = document.createElement('canvas');
@@ -189,8 +242,17 @@ export function ImageReportBuilder({ active }) {
   const [notice, setNotice] = useState(null); // { text, good }
   const [dropActive, setDropActive] = useState(false);
   const [toast, setToast] = useState(null); // { id, good, title, detail }
+  // Free mode: a box per image id, in sheet pixels, plus the chosen sheet width (null = as wide
+  // as the automatic layout would make it). Kept while the other modes are in use, so switching
+  // away and back does not throw an arrangement away.
+  const [freeBoxes, setFreeBoxes] = useState({});
+  const [sheetWidth, setSheetWidth] = useState(null);
+  const [selectedId, setSelectedId] = useState(null);
+  const [stageWidth, setStageWidth] = useState(0);
   const fileInputRef = useRef(null);
   const dragIndexRef = useRef(null);
+  const stageRef = useRef(null);
+  const dragRef = useRef(null); // { id, kind, startX, startY, box, others, ds }
   // Images decode asynchronously; a quick second paste could otherwise land above the first.
   // Each batch waits for the one before it, so the stack is always in the order things arrived.
   const queueRef = useRef(Promise.resolve());
@@ -250,35 +312,89 @@ export function ImageReportBuilder({ active }) {
     [],
   );
 
+  const gap = SPACING[spacing];
+  const autoLayout = layoutReport(items, { gap, margin: gap, mode: mode === 'free' ? 'fit' : mode });
+  const freeSheetWidth = sheetWidth ?? autoLayout.width;
+  const layout = (mode === 'free' && freeLayout(items, freeBoxes, { margin: gap, sheetWidth: freeSheetWidth })) || autoLayout;
+  // Everything the finished PNG depends on — widening the sheet moves no box at all, and free
+  // mode is seeded from the automatic layout, so a key of boxes alone would leave the export
+  // (and its "3 rows" label) stale in both cases.
+  const layoutKey = JSON.stringify([layout.width, layout.height, layout.rows, layout.boxes]);
+
+  // Seed free mode from whatever the automatic layout produced — nobody wants to place ten
+  // screenshots on an empty sheet — and give anything pasted later a place below the rest.
+  useEffect(() => {
+    if (mode !== 'free' || !items.length) return;
+    setFreeBoxes((prev) => {
+      const next = {};
+      let changed = false;
+      let bottom = gap;
+      items.forEach((item) => {
+        if (prev[item.id]) bottom = Math.max(bottom, prev[item.id].y + prev[item.id].h);
+      });
+      items.forEach((item, index) => {
+        if (prev[item.id]) {
+          next[item.id] = prev[item.id];
+          return;
+        }
+        changed = true;
+        const seeded = autoLayout.boxes[index];
+        const isFirstPass = !Object.keys(prev).length;
+        next[item.id] = isFirstPass ? { ...seeded } : { x: gap, y: bottom + gap, w: item.width, h: item.height };
+        if (!isFirstPass) bottom = next[item.id].y + next[item.id].h;
+      });
+      // Drop boxes belonging to images that have since been removed.
+      if (!changed && Object.keys(prev).length === items.length) return prev;
+      return next;
+    });
+  }, [mode, items, autoLayout, gap]);
+
+  // Measure the area the sheet is shown in, so the on-screen preview can be scaled to fit while
+  // every box stays in full-size sheet pixels.
+  useEffect(() => {
+    const el = stageRef.current;
+    if (!el) return undefined;
+    const observer = new ResizeObserver(([entry]) => setStageWidth(entry.contentRect.width));
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [mode, items.length]);
+
   // The preview is the finished PNG itself, re-rendered on every change — what is shown is
-  // exactly what is downloaded or copied.
+  // exactly what is downloaded or copied. In free mode the stage below is the live preview, so
+  // the PNG is rebuilt a moment after dragging stops rather than on every pointer move.
   useEffect(() => {
     if (!items.length) {
       setOutput(null);
       return undefined;
     }
     let cancelled = false;
-    const gap = SPACING[spacing];
-    const layout = layoutReport(items, { gap, margin: gap, mode });
+    let timer = null;
     setComposing(true);
-    drawReport(items, layout)
-      .then((blob) => {
-        if (cancelled) return;
-        setOutput({
-          url: URL.createObjectURL(blob),
-          blob,
-          width: Math.round(layout.width * layout.scale),
-          height: Math.round(layout.height * layout.scale),
-          rows: layout.rows,
-          scaled: layout.scale < 1,
-        });
-      })
-      .catch((err) => !cancelled && setNotice({ text: err.message, good: false }))
-      .finally(() => !cancelled && setComposing(false));
+    const compose = () =>
+      drawReport(items, layout)
+        .then((blob) => {
+          if (cancelled) return;
+          setOutput({
+            url: URL.createObjectURL(blob),
+            blob,
+            width: Math.round(layout.width * layout.scale),
+            height: Math.round(layout.height * layout.scale),
+            rows: layout.rows,
+            scaled: layout.scale < 1,
+          });
+        })
+        .catch((err) => !cancelled && setNotice({ text: err.message, good: false }))
+        .finally(() => !cancelled && setComposing(false));
+
+    if (mode === 'free') timer = setTimeout(compose, 250);
+    else compose();
     return () => {
       cancelled = true;
+      if (timer) clearTimeout(timer);
     };
-  }, [items, spacing, mode]);
+    // layoutKey stands in for the layout object, which is rebuilt on every render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [items, mode, layoutKey]);
 
   useEffect(() => () => output && URL.revokeObjectURL(output.url), [output]);
 
@@ -299,7 +415,106 @@ export function ImageReportBuilder({ active }) {
     });
   }
 
+  const displayScale = stageWidth && layout.width ? Math.min(1, stageWidth / layout.width) : 1;
+  const selectedItem = items.find((item) => item.id === selectedId) || null;
+
+  function updateBox(id, changes) {
+    setFreeBoxes((prev) => (prev[id] ? { ...prev, [id]: { ...prev[id], ...changes } } : prev));
+  }
+
+  // Drag to move, corner to resize. Pointer capture keeps the gesture alive when the pointer
+  // runs off the image — or off the sheet — mid-drag.
+  function startGesture(e, item, kind) {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    e.stopPropagation();
+    setSelectedId(item.id);
+    // preventDefault above stops the browser focusing the image on its own, which would leave
+    // the arrow keys doing nothing straight after clicking one. (For the resize handle, the
+    // image is its parent.)
+    const node = kind === 'resize' ? e.currentTarget.parentElement : e.currentTarget;
+    node?.focus?.();
+    e.currentTarget.setPointerCapture(e.pointerId);
+    dragRef.current = {
+      id: item.id,
+      kind,
+      startX: e.clientX,
+      startY: e.clientY,
+      box: freeBoxes[item.id],
+      others: items.filter((other) => other.id !== item.id).map((other) => freeBoxes[other.id]).filter(Boolean),
+    };
+  }
+
+  function moveGesture(e) {
+    const drag = dragRef.current;
+    if (!drag) return;
+    const dx = (e.clientX - drag.startX) / displayScale;
+    const dy = (e.clientY - drag.startY) / displayScale;
+    const tolerance = 8 / displayScale;
+
+    if (drag.kind === 'resize') {
+      // Proportional only: a screenshot stretched on one axis looks broken immediately.
+      const ratio = drag.box.h / drag.box.w;
+      const w = Math.max(40, drag.box.w + dx);
+      updateBox(drag.id, { w, h: w * ratio });
+      return;
+    }
+    const moved = { ...drag.box, x: drag.box.x + dx, y: Math.max(0, drag.box.y + dy) };
+    const snapped = snapBox(moved, drag.others, { margin: gap, sheetWidth: freeSheetWidth, tolerance });
+    updateBox(drag.id, { x: Math.max(0, snapped.x), y: Math.max(0, snapped.y) });
+  }
+
+  function endGesture(e) {
+    if (!dragRef.current) return;
+    e.currentTarget.releasePointerCapture?.(e.pointerId);
+    dragRef.current = null;
+  }
+
+  function nudge(e, item) {
+    const box = freeBoxes[item.id];
+    if (!box) return;
+    const step = e.shiftKey ? 10 : 1;
+    const keys = { ArrowLeft: { x: box.x - step }, ArrowRight: { x: box.x + step }, ArrowUp: { y: Math.max(0, box.y - step) }, ArrowDown: { y: box.y + step } };
+    if (keys[e.key]) {
+      e.preventDefault();
+      updateBox(item.id, keys[e.key]);
+      return;
+    }
+    if (e.key === '+' || e.key === '=' || e.key === '-') {
+      e.preventDefault();
+      const factor = e.key === '-' ? 0.98 : 1.02;
+      updateBox(item.id, { w: Math.max(40, box.w * factor), h: Math.max(40 * (box.h / box.w), box.h * factor) });
+      return;
+    }
+    if (e.key === 'Delete' || e.key === 'Backspace') {
+      e.preventDefault();
+      remove(item.id);
+    }
+  }
+
+  // Per-image actions for the selected image, in sheet pixels.
+  function actualSize(item) {
+    updateBox(item.id, { w: item.width, h: item.height });
+  }
+
+  function fillWidth(item) {
+    const box = freeBoxes[item.id];
+    if (!box) return;
+    const w = freeSheetWidth - gap * 2;
+    updateBox(item.id, { x: gap, w, h: w * (box.h / box.w) });
+  }
+
+  function autoArrange() {
+    setFreeBoxes(Object.fromEntries(items.map((item, index) => [item.id, { ...autoLayout.boxes[index] }])));
+    setSheetWidth(null);
+  }
+
   function remove(id) {
+    setFreeBoxes((prev) => {
+      const { [id]: gone, ...rest } = prev;
+      return gone ? rest : prev;
+    });
+    setSelectedId((current) => (current === id ? null : current));
     setItems((list) => {
       const item = list.find((i) => i.id === id);
       if (item) URL.revokeObjectURL(item.url);
@@ -310,6 +525,9 @@ export function ImageReportBuilder({ active }) {
   function clearAll() {
     items.forEach((item) => URL.revokeObjectURL(item.url));
     setItems([]);
+    setFreeBoxes({});
+    setSheetWidth(null);
+    setSelectedId(null);
     setNotice(null);
   }
 
@@ -398,7 +616,7 @@ export function ImageReportBuilder({ active }) {
           Press <kbd className="rounded border px-1.5 py-0.5 text-xs">Ctrl</kbd> + <kbd className="rounded border px-1.5 py-0.5 text-xs">V</kbd> to add a screenshot
         </div>
         <div className="mt-1 text-xs" style={{ color: 'var(--text-muted)' }}>
-          They are arranged in the order you paste them — side by side where two fit, otherwise one per row. You can also drop image files here.
+          They are arranged in the order you paste them — or switch Layout to <strong>Free</strong> below and place them yourself. You can also drop image files here.
         </div>
         <div className="mt-3 flex flex-wrap justify-center gap-2">
           {canReadClipboard && (
@@ -518,8 +736,23 @@ export function ImageReportBuilder({ active }) {
                 <select value={mode} onChange={(e) => setMode(e.target.value)} className={`rounded-lg px-2 py-1 text-sm ${FOCUS_RING}`} style={{ background: 'var(--surface-2)', color: 'var(--text-primary)' }}>
                   <option value="fit">Fit — fill the width</option>
                   <option value="stack">Stack — one per row</option>
+                  <option value="free">Free — arrange it yourself</option>
                 </select>
               </label>
+              {mode === 'free' && (
+                <label className="flex items-center gap-1.5">
+                  Sheet width
+                  <input
+                    type="number"
+                    min="200"
+                    step="10"
+                    value={Math.round(freeSheetWidth)}
+                    onChange={(e) => setSheetWidth(Math.max(200, Number(e.target.value) || 200))}
+                    className={`w-24 rounded-lg px-2 py-1 text-sm tabular-nums ${FOCUS_RING}`}
+                    style={{ background: 'var(--surface-2)', color: 'var(--text-primary)' }}
+                  />
+                </label>
+              )}
               <label className="flex items-center gap-1.5">
                 Spacing
                 <select value={spacing} onChange={(e) => setSpacing(e.target.value)} className={`rounded-lg px-2 py-1 text-sm ${FOCUS_RING}`} style={{ background: 'var(--surface-2)', color: 'var(--text-primary)' }}>
@@ -531,7 +764,8 @@ export function ImageReportBuilder({ active }) {
               </label>
               {output && (
                 <span className="tabular-nums">
-                  {output.width} × {output.height} px · {output.rows} row{output.rows === 1 ? '' : 's'}
+                  {output.width} × {output.height} px
+                  {output.rows ? ` · ${output.rows} row${output.rows === 1 ? '' : 's'}` : ' · arranged by hand'}
                   {output.scaled ? ' (scaled down — too large for the browser at full size)' : ''}
                 </span>
               )}
@@ -545,8 +779,103 @@ export function ImageReportBuilder({ active }) {
               </button>
             </div>
           </div>
+          {mode === 'free' && (
+            <div className="flex flex-wrap items-center gap-2 border-b px-4 py-2 sm:px-5" style={{ borderColor: 'var(--baseline)' }}>
+              <span className="text-xs" style={{ color: 'var(--text-muted)' }}>
+                {selectedItem ? selectedItem.name : 'Drag to move · corner to resize · arrow keys nudge · Delete removes'}
+              </span>
+              <div className="ml-auto flex flex-wrap gap-2">
+                <button type="button" onClick={autoArrange} className={BUTTON} style={{ color: 'var(--text-secondary)' }} title="Lay everything out again automatically and start from there">
+                  Auto-arrange
+                </button>
+                <button type="button" onClick={() => actualSize(selectedItem)} disabled={!selectedItem} className={BUTTON} style={{ color: 'var(--text-secondary)' }}>
+                  Actual size
+                </button>
+                <button type="button" onClick={() => fillWidth(selectedItem)} disabled={!selectedItem} className={BUTTON} style={{ color: 'var(--text-secondary)' }}>
+                  Fill width
+                </button>
+                <button
+                  type="button"
+                  onClick={() => move(items.findIndex((i) => i.id === selectedId), items.length - 1)}
+                  disabled={!selectedItem}
+                  className={BUTTON}
+                  style={{ color: 'var(--text-secondary)' }}
+                  title="Draw this one on top of the others"
+                >
+                  Bring to front
+                </button>
+                <button
+                  type="button"
+                  onClick={() => move(items.findIndex((i) => i.id === selectedId), 0)}
+                  disabled={!selectedItem}
+                  className={BUTTON}
+                  style={{ color: 'var(--text-secondary)' }}
+                >
+                  Send to back
+                </button>
+              </div>
+            </div>
+          )}
           <div className="max-h-[75vh] overflow-auto p-4 sm:p-5">
-            {output ? (
+            {mode === 'free' ? (
+              // The stage is the preview: boxes are held in full-size sheet pixels and only
+              // scaled for display, so what is dragged here is what the PNG contains.
+              <div ref={stageRef}>
+                <div
+                  className="relative select-none border"
+                  onPointerDown={() => setSelectedId(null)}
+                  style={{
+                    width: layout.width * displayScale,
+                    height: layout.height * displayScale,
+                    background: BACKGROUND,
+                    borderColor: 'var(--baseline)',
+                  }}
+                >
+                  {items.map((item, index) => {
+                    const box = freeBoxes[item.id];
+                    if (!box) return null;
+                    const selected = selectedId === item.id;
+                    return (
+                      <div
+                        key={item.id}
+                        role="button"
+                        tabIndex={0}
+                        aria-label={`${item.name}, image ${index + 1}. Arrow keys move, plus and minus resize, Delete removes.`}
+                        onPointerDown={(e) => startGesture(e, item, 'move')}
+                        onPointerMove={moveGesture}
+                        onPointerUp={endGesture}
+                        onPointerCancel={endGesture}
+                        onKeyDown={(e) => nudge(e, item)}
+                        onFocus={() => setSelectedId(item.id)}
+                        className={`absolute cursor-grab touch-none active:cursor-grabbing ${FOCUS_RING}`}
+                        style={{
+                          left: box.x * displayScale,
+                          top: box.y * displayScale,
+                          width: box.w * displayScale,
+                          height: box.h * displayScale,
+                          outline: selected ? '2px solid var(--series-1)' : `1px solid ${IMAGE_BORDER}`,
+                          outlineOffset: selected ? '1px' : '0',
+                          zIndex: index + 1,
+                        }}
+                      >
+                        <img src={item.url} alt="" draggable={false} className="pointer-events-none h-full w-full" />
+                        {selected && (
+                          <span
+                            onPointerDown={(e) => startGesture(e, item, 'resize')}
+                            onPointerMove={moveGesture}
+                            onPointerUp={endGesture}
+                            onPointerCancel={endGesture}
+                            aria-hidden="true"
+                            className="absolute -bottom-1.5 -right-1.5 h-4 w-4 cursor-nwse-resize touch-none rounded-sm border-2 border-white"
+                            style={{ background: 'var(--series-1)' }}
+                          />
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            ) : output ? (
               <img
                 src={output.url}
                 alt={`Combined report of ${items.length} images`}
