@@ -11,7 +11,23 @@ const FOCUS_RING = 'focus-visible:outline focus-visible:outline-2 focus-visible:
 const BUTTON = `rounded-full border px-3 py-1 text-xs font-medium transition-colors hover:bg-[var(--surface-2)] disabled:cursor-not-allowed disabled:opacity-50 ${FOCUS_RING}`;
 const PRIMARY_BUTTON = `rounded-full px-4 py-2 text-sm font-medium text-white transition-[filter] hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:brightness-100 ${FOCUS_RING}`;
 
-const SPACING = { none: 0, small: 6, medium: 16 };
+// One control sets both the gutter between images and the margin around the whole sheet, so
+// the border always matches the gaps — the thing that makes a pasted-together sheet look made
+// rather than assembled.
+const SPACING = { none: 0, tight: 8, normal: 16, roomy: 28 };
+
+// Row packing. A row is filled until adding the next image would squeeze the row below
+// MIN_SCALE, and closed as soon as it is full enough not to need stretching past MAX_SCALE.
+// The caps exist because these are screenshots of small type: blowing one up to fill the width
+// turns the figures to mush, and shrinking a wide table too far makes it unreadable. A row that
+// cannot fill the width even at MAX_SCALE is centred instead — deliberate white on both sides
+// reads as a margin, while white down one edge reads as a mistake.
+const MIN_SCALE = 0.55;
+const MAX_SCALE = 1.35;
+
+// A hairline round each image. Two white screenshots side by side otherwise run into each other
+// with no edge to tell them apart.
+const IMAGE_BORDER = '#d4d4d8';
 
 // The finished image is always on white, whatever the page theme: the screenshots are of a
 // white spreadsheet, and a dark or transparent gap between them would show in the email.
@@ -23,21 +39,65 @@ const BACKGROUND = '#ffffff';
 const MAX_SIDE = 16_384;
 const MAX_AREA = 268_000_000;
 
-function layoutReport(sizes, { gap, align }) {
-  const width = Math.max(0, ...sizes.map((s) => s.width));
-  let y = 0;
-  const positions = sizes.map((s, i) => {
-    const position = { x: align === 'center' ? Math.floor((width - s.width) / 2) : 0, y };
-    y += s.height + (i < sizes.length - 1 ? gap : 0);
-    return position;
+// Greedy, left to right, in the order the images are listed — so the sheet still reads
+// chronologically, row by row, the way the printed report does.
+function packRows(sizes, target, gap) {
+  const rows = [];
+  let row = [];
+  let natural = 0;
+  sizes.forEach((size, index) => {
+    const candidate = natural + size.width + (row.length ? gap : 0);
+    if (row.length && target / candidate < MIN_SCALE) {
+      rows.push(row);
+      row = [index];
+      natural = size.width;
+    } else {
+      row.push(index);
+      natural = candidate;
+    }
+    if (target / natural <= MAX_SCALE) {
+      rows.push(row);
+      row = [];
+      natural = 0;
+    }
   });
-  const height = y;
-  const scale = width && height ? Math.min(1, MAX_SIDE / width, MAX_SIDE / height, Math.sqrt(MAX_AREA / (width * height))) : 1;
-  return { width, height, positions, scale };
+  if (row.length) rows.push(row);
+  return rows;
+}
+
+function layoutReport(sizes, { gap, margin, mode }) {
+  if (!sizes.length) return { width: 0, height: 0, boxes: [], rows: 0, scale: 1 };
+  // The widest image sets the sheet width, so at least one image is always at its true size and
+  // nothing has to be blown up to reach an arbitrary target.
+  const content = Math.max(...sizes.map((s) => s.width));
+  const rows = mode === 'stack' ? sizes.map((_, i) => [i]) : packRows(sizes, content, gap);
+
+  const boxes = [];
+  let y = margin;
+  rows.forEach((indexes, rowIndex) => {
+    const natural = indexes.reduce((sum, i) => sum + sizes[i].width, 0) + gap * (indexes.length - 1);
+    const rowScale = Math.min(content / natural, MAX_SCALE);
+    const rowWidth = natural * rowScale;
+    let x = margin + (content - rowWidth) / 2; // only ever off-centre when the row is capped
+    let rowHeight = 0;
+    indexes.forEach((i) => {
+      const w = sizes[i].width * rowScale;
+      const h = sizes[i].height * rowScale;
+      boxes[i] = { x, y, w, h };
+      x += w + gap * rowScale;
+      rowHeight = Math.max(rowHeight, h);
+    });
+    y += rowHeight + (rowIndex < rows.length - 1 ? gap : 0);
+  });
+
+  const width = content + margin * 2;
+  const height = y + margin;
+  const scale = Math.min(1, MAX_SIDE / width, MAX_SIDE / height, Math.sqrt(MAX_AREA / (width * height)));
+  return { width, height, boxes, rows: rows.length, scale };
 }
 
 function drawReport(items, layout) {
-  const { positions, scale } = layout;
+  const { boxes, scale } = layout;
   const canvas = document.createElement('canvas');
   canvas.width = Math.max(1, Math.round(layout.width * scale));
   canvas.height = Math.max(1, Math.round(layout.height * scale));
@@ -46,7 +106,14 @@ function drawReport(items, layout) {
   ctx.fillRect(0, 0, canvas.width, canvas.height);
   ctx.imageSmoothingQuality = 'high';
   items.forEach((item, i) => {
-    ctx.drawImage(item.img, positions[i].x * scale, positions[i].y * scale, item.width * scale, item.height * scale);
+    const { x, y, w, h } = boxes[i];
+    ctx.drawImage(item.img, x * scale, y * scale, w * scale, h * scale);
+  });
+  // Drawn after every image, so a hairline is never painted over by the next one along.
+  ctx.strokeStyle = IMAGE_BORDER;
+  ctx.lineWidth = 1;
+  boxes.forEach(({ x, y, w, h }) => {
+    ctx.strokeRect(Math.round(x * scale) + 0.5, Math.round(y * scale) + 0.5, Math.round(w * scale) - 1, Math.round(h * scale) - 1);
   });
   return new Promise((resolve, reject) => {
     canvas.toBlob((blob) => (blob ? resolve(blob) : reject(new Error('The browser could not produce the image.'))), 'image/png');
@@ -115,8 +182,8 @@ let nextSeq = 0;
 
 export function ImageReportBuilder({ active }) {
   const [items, setItems] = useState([]);
-  const [spacing, setSpacing] = useState('small');
-  const [align, setAlign] = useState('left');
+  const [spacing, setSpacing] = useState('normal');
+  const [mode, setMode] = useState('fit');
   const [output, setOutput] = useState(null); // { url, blob, width, height, scaled }
   const [composing, setComposing] = useState(false);
   const [notice, setNotice] = useState(null); // { text, good }
@@ -191,7 +258,8 @@ export function ImageReportBuilder({ active }) {
       return undefined;
     }
     let cancelled = false;
-    const layout = layoutReport(items, { gap: SPACING[spacing], align });
+    const gap = SPACING[spacing];
+    const layout = layoutReport(items, { gap, margin: gap, mode });
     setComposing(true);
     drawReport(items, layout)
       .then((blob) => {
@@ -201,6 +269,7 @@ export function ImageReportBuilder({ active }) {
           blob,
           width: Math.round(layout.width * layout.scale),
           height: Math.round(layout.height * layout.scale),
+          rows: layout.rows,
           scaled: layout.scale < 1,
         });
       })
@@ -209,7 +278,7 @@ export function ImageReportBuilder({ active }) {
     return () => {
       cancelled = true;
     };
-  }, [items, spacing, align]);
+  }, [items, spacing, mode]);
 
   useEffect(() => () => output && URL.revokeObjectURL(output.url), [output]);
 
@@ -329,7 +398,7 @@ export function ImageReportBuilder({ active }) {
           Press <kbd className="rounded border px-1.5 py-0.5 text-xs">Ctrl</kbd> + <kbd className="rounded border px-1.5 py-0.5 text-xs">V</kbd> to add a screenshot
         </div>
         <div className="mt-1 text-xs" style={{ color: 'var(--text-muted)' }}>
-          Each one is added below the last, in the order you paste them. You can also drop image files here.
+          They are arranged in the order you paste them — side by side where two fit, otherwise one per row. You can also drop image files here.
         </div>
         <div className="mt-3 flex flex-wrap justify-center gap-2">
           {canReadClipboard && (
@@ -366,7 +435,7 @@ export function ImageReportBuilder({ active }) {
         <div className="rounded-2xl border p-4 sm:p-5" style={{ background: 'var(--surface-1)' }}>
           <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
             <div className="text-sm font-semibold" style={{ color: 'var(--text-primary)' }}>
-              Images ({items.length}) — top to bottom
+              Images ({items.length}) — in order
             </div>
             <div className="flex flex-wrap gap-2">
               <button type="button" onClick={resetOrder} className={BUTTON} style={{ color: 'var(--text-secondary)' }} title="Put the images back in the order they were taken or pasted">
@@ -445,23 +514,25 @@ export function ImageReportBuilder({ active }) {
           <div className="flex flex-wrap items-center justify-between gap-3 border-b p-4 sm:p-5" style={{ borderColor: 'var(--baseline)' }}>
             <div className="flex flex-wrap items-center gap-3 text-xs" style={{ color: 'var(--text-muted)' }}>
               <label className="flex items-center gap-1.5">
-                Spacing
-                <select value={spacing} onChange={(e) => setSpacing(e.target.value)} className={`rounded-lg px-2 py-1 text-sm ${FOCUS_RING}`} style={{ background: 'var(--surface-2)', color: 'var(--text-primary)' }}>
-                  <option value="none">None</option>
-                  <option value="small">Small</option>
-                  <option value="medium">Medium</option>
+                Layout
+                <select value={mode} onChange={(e) => setMode(e.target.value)} className={`rounded-lg px-2 py-1 text-sm ${FOCUS_RING}`} style={{ background: 'var(--surface-2)', color: 'var(--text-primary)' }}>
+                  <option value="fit">Fit — fill the width</option>
+                  <option value="stack">Stack — one per row</option>
                 </select>
               </label>
               <label className="flex items-center gap-1.5">
-                Align
-                <select value={align} onChange={(e) => setAlign(e.target.value)} className={`rounded-lg px-2 py-1 text-sm ${FOCUS_RING}`} style={{ background: 'var(--surface-2)', color: 'var(--text-primary)' }}>
-                  <option value="left">Left</option>
-                  <option value="center">Centre</option>
+                Spacing
+                <select value={spacing} onChange={(e) => setSpacing(e.target.value)} className={`rounded-lg px-2 py-1 text-sm ${FOCUS_RING}`} style={{ background: 'var(--surface-2)', color: 'var(--text-primary)' }}>
+                  <option value="none">None</option>
+                  <option value="tight">Tight</option>
+                  <option value="normal">Normal</option>
+                  <option value="roomy">Roomy</option>
                 </select>
               </label>
               {output && (
                 <span className="tabular-nums">
-                  {output.width} × {output.height} px{output.scaled ? ' (scaled down — too tall for the browser at full size)' : ''}
+                  {output.width} × {output.height} px · {output.rows} row{output.rows === 1 ? '' : 's'}
+                  {output.scaled ? ' (scaled down — too large for the browser at full size)' : ''}
                 </span>
               )}
             </div>
